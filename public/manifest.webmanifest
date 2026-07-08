@@ -1,17 +1,17 @@
 {
-  "name": "TheCrazyAnalyst",
-  "short_name": "CrazyAnalyst",
-  "description": "Rapports sans filtre sur vos conversations, générés par IA.",
-  "start_url": "./index.html",
-  "scope": "./",
+  "name": "2 Sans Filtres",
+  "short_name": "2SF",
+  "description": "Rapports sans filtre sur vos conversations",
+  "start_url": "/",
+  "scope": "/",
   "display": "standalone",
   "orientation": "portrait",
   "background_color": "#FBF6ED",
   "theme_color": "#FBF6ED",
-  "lang": "fr",
   "icons": [
     { "src": "./icons/icon-192.png", "sizes": "192x192", "type": "image/png", "purpose": "any" },
     { "src": "./icons/icon-512.png", "sizes": "512x512", "type": "image/png", "purpose": "any" },
-    { "src": "./icons/icon-512-maskable.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
+    { "src": "./icons/icon-maskable-192.png", "sizes": "192x192", "type": "image/png", "purpose": "maskable" },
+    { "src": "./icons/icon-maskable-512.png", "sizes": "512x512", "type": "image/png", "purpose": "maskable" }
   ]
 }
