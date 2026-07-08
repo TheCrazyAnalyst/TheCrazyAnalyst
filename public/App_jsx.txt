@@ -519,11 +519,30 @@ async function resolveGeminiModel(apiKey) {
   }
 }
 
+/* Le "thinking" (raisonnement interne) est activé par défaut sur tous les
+   modèles Gemini récents et consomme le MÊME budget de tokens que la
+   réponse visible (maxOutputTokens). Sans configuration explicite, ce budget
+   est dynamique et peut à lui seul dépasser maxOutputTokens — la réponse
+   visible sort alors vide avec finishReason=MAX_TOKENS, même sur une simple
+   requête de test. Gemini 3.x et versions ultérieures utilisent
+   thinkingConfig.thinkingLevel (le mettre en même temps que thinkingBudget
+   fait échouer la requête) ; Gemini 2.5 et antérieurs ignorent thinkingLevel
+   et doivent utiliser thinkingConfig.thinkingBudget (0 = désactivé, -1 =
+   dynamique ; sur les modèles "Pro" qui ne peuvent pas désactiver la
+   réflexion, 0 est simplement remonté au minimum autorisé par l'API). */
+function buildThinkingConfig(model, level) {
+  const wantsHigh = level === "high";
+  if (/^gemini-3/.test(model)) {
+    return { thinkingLevel: wantsHigh ? "high" : "low" };
+  }
+  return { thinkingBudget: wantsHigh ? -1 : 0 };
+}
+
 /* Gemini — new default provider. Choisit dynamiquement le meilleur modèle
    réellement accessible avec la clé fournie (voir resolveGeminiModel) et
    demande une réponse JSON native à l'API, plus fiable que de faire formater
    le JSON par le modèle en texte brut. */
-async function callGemini({ system, userContent, maxTokens, apiKey, thinkingLevel, retries = 3 }) {
+async function callGemini({ system, userContent, maxTokens, apiKey, thinkingLevel = "low", retries = 3 }) {
   if (!apiKey) throw new Error("no-api-key: ajoute ta clé API Gemini dans les réglages.");
   const model = await resolveGeminiModel(apiKey);
   let attempt = 0;
@@ -534,8 +553,8 @@ async function callGemini({ system, userContent, maxTokens, apiKey, thinkingLeve
         responseMimeType: "application/json",
         maxOutputTokens: maxTokens,
         temperature: 1,
+        thinkingConfig: buildThinkingConfig(model, thinkingLevel),
       };
-      if (thinkingLevel) generationConfig.thinkingConfig = { thinkingLevel };
       res = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
         {
