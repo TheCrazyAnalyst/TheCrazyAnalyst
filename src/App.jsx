@@ -228,7 +228,7 @@ function approxMessageCount(text) {
 
 /* --------------------------------- App --------------------------------- */
 
-const BUILD_TAG = "v15.1 — app autonome (Gemini par défaut), analyse illimitée par découpage + mémoire cumulative, formats de clé Gemini AIza/AQ. pris en charge";
+const BUILD_TAG = "v15.2 — fix: retry auto sur réponse vide (MAX_TOKENS/thinking) + abandon explicite si l'extraction échoue au lieu d'un rapport inventé";
 
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
@@ -472,24 +472,108 @@ async function callClaude({ system, userContent, maxTokens, apiKey, retries = 2 
   }
 }
 
-/* Gemini — new default provider. Uses the free-tier-friendly "flash-latest"
-   evergreen alias (1M-token context window, currently Gemini 3.5 Flash) and
-   asks the API for a native JSON response, which is more reliable than
-   asking the model to format JSON itself in plain text. */
-async function callGemini({ system, userContent, maxTokens, apiKey, thinkingLevel, retries = 3 }) {
+/* Sélection automatique du meilleur modèle Gemini réellement accessible avec
+   la clé de l'utilisateur. On interroge models.list — qui reflète les droits
+   réels de la clé/projet — puis on note chaque modèle utilisable pour
+   generateContent (en excluant vision/audio/image/embeddings, etc.) pour
+   garder le plus capable. Résultat mis en cache en mémoire par clé pour ne
+   pas relister à chaque appel. En cas d'échec (réseau, clé pas encore
+   testée...), on retombe sur l'alias évergreen "gemini-flash-latest" ; l'appel
+   generateContent qui suit remontera alors la vraie erreur si besoin. */
+const geminiModelCache = new Map();
+
+function scoreGeminiModel(id) {
+  if (!/^gemini-/.test(id)) return -1;
+  if (/embedding|aqa|vision|image|imagen|veo|tts|audio|video|gemma|learnlm|robotics|computer-use|flash-8b|flash-lite/i.test(id)) return -1;
+  const tier = /-pro/.test(id) ? 3 : /-flash/.test(id) ? 2 : 1;
+  const verMatch = id.match(/(\d+(?:\.\d+)?)/);
+  let version = verMatch ? parseFloat(verMatch[1]) : 0;
+  if (/latest/.test(id)) version += 100; // un alias "-latest" pointe toujours vers le plus récent modèle stable
+  return tier * 1000 + version;
+}
+
+async function resolveGeminiModel(apiKey) {
+  if (geminiModelCache.has(apiKey)) return geminiModelCache.get(apiKey);
+  const fallback = "gemini-flash-latest";
+  try {
+    const res = await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200", {
+      headers: { "x-goog-api-key": apiKey },
+    });
+    if (!res.ok) throw new Error(`http-${res.status}`);
+    const data = await res.json();
+    const usable = (data.models || [])
+      .filter((m) => (m.supportedGenerationMethods || []).includes("generateContent"))
+      .map((m) => (m.name || "").replace(/^models\//, ""))
+      .filter(Boolean);
+    let best = null, bestScore = -1;
+    for (const id of usable) {
+      const s = scoreGeminiModel(id);
+      if (s > bestScore) { bestScore = s; best = id; }
+    }
+    const chosen = best || fallback;
+    geminiModelCache.set(apiKey, chosen);
+    return chosen;
+  } catch {
+    geminiModelCache.set(apiKey, fallback);
+    return fallback;
+  }
+}
+
+/* Le "thinking" (raisonnement interne) est activé par défaut sur tous les
+   modèles Gemini récents et consomme le MÊME budget de tokens que la
+   réponse visible (maxOutputTokens). Sans configuration explicite, ce budget
+   est dynamique et peut à lui seul dépasser maxOutputTokens — la réponse
+   visible sort alors vide avec finishReason=MAX_TOKENS, même sur une simple
+   requête de test. Gemini 3.x et versions ultérieures utilisent
+   thinkingConfig.thinkingLevel (le mettre en même temps que thinkingBudget
+   fait échouer la requête) ; Gemini 2.5 et antérieurs ignorent thinkingLevel
+   et doivent utiliser thinkingConfig.thinkingBudget (0 = désactivé, -1 =
+   dynamique ; sur les modèles "Pro" qui ne peuvent pas désactiver la
+   réflexion, 0 est simplement remonté au minimum autorisé par l'API). */
+function buildThinkingConfig(model, level) {
+  const wantsHigh = level === "high";
+  if (/^gemini-3/.test(model)) {
+    return { thinkingLevel: wantsHigh ? "high" : "low" };
+  }
+  return { thinkingBudget: wantsHigh ? -1 : 0 };
+}
+
+/* Gemini — new default provider. Choisit dynamiquement le meilleur modèle
+   réellement accessible avec la clé fournie (voir resolveGeminiModel) et
+   demande une réponse JSON native à l'API, plus fiable que de faire formater
+   le JSON par le modèle en texte brut. */
+/* BUGFIX (see notes above buildThinkingConfig): on some models "thinking"
+   cannot be fully disabled and is billed out of the SAME maxOutputTokens
+   budget as the visible answer. With a tight budget this can silently eat
+   100% of it, so the API comes back "successful" (200 OK) but with an empty
+   text and finishReason=MAX_TOKENS. The caller has no way to tell that
+   apart from "the model genuinely had nothing to say", which is exactly
+   what was happening here: the key-test call (budget 300) and every MAP
+   extraction call (budget 4096) were silently starving on thinking tokens.
+   The fix is to treat empty+MAX_TOKENS as a distinct, recoverable case:
+   retry the SAME request with a much larger budget before giving up, on
+   top of (not instead of) the existing 429/503 retry loop below. */
+const EMPTY_RESPONSE_MAX_RETRIES = 3;
+const EMPTY_RESPONSE_BUDGET_MULTIPLIER = 4;
+const EMPTY_RESPONSE_BUDGET_CEILING = 32768;
+
+async function callGemini({ system, userContent, maxTokens, apiKey, thinkingLevel = "low", retries = 3 }) {
   if (!apiKey) throw new Error("no-api-key: ajoute ta clé API Gemini dans les réglages.");
+  const model = await resolveGeminiModel(apiKey);
   let attempt = 0;
+  let currentMaxTokens = maxTokens;
+  let emptyAttempt = 0;
   while (true) {
     let res;
     try {
       const generationConfig = {
         responseMimeType: "application/json",
-        maxOutputTokens: maxTokens,
+        maxOutputTokens: currentMaxTokens,
         temperature: 1,
+        thinkingConfig: buildThinkingConfig(model, thinkingLevel),
       };
-      if (thinkingLevel) generationConfig.thinkingConfig = { thinkingLevel };
       res = await fetch(
-        "https://generativelanguage.googleapis.com/v1beta/models/gemini-flash-latest:generateContent",
+        `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json", "x-goog-api-key": apiKey },
@@ -530,11 +614,17 @@ async function callGemini({ system, userContent, maxTokens, apiKey, thinkingLeve
     const data = await res.json();
     const candidate = data.candidates?.[0];
     const text = (candidate?.content?.parts || []).map((p) => p.text || "").join("\n");
+    const reason = candidate?.finishReason || "unknown";
+
     if (!text.trim()) {
-      const reason = candidate?.finishReason || "unknown";
+      if (reason === "MAX_TOKENS" && emptyAttempt < EMPTY_RESPONSE_MAX_RETRIES) {
+        emptyAttempt += 1;
+        currentMaxTokens = Math.min(currentMaxTokens * EMPTY_RESPONSE_BUDGET_MULTIPLIER, EMPTY_RESPONSE_BUDGET_CEILING);
+        continue;
+      }
       throw new Error(`empty-response: aucun texte renvoyé (finishReason=${reason}), peut-être un blocage de sécurité.`);
     }
-    return { text, stopReason: candidate?.finishReason };
+    return { text, stopReason: reason };
   }
 }
 
@@ -560,14 +650,24 @@ async function testApiKey(provider, apiKey) {
     const res = await callGemini({
       system: "Réponds uniquement par le mot OK, rien d'autre.",
       userContent: "Test.",
-      maxTokens: 20,
+      // Was 300: too tight on models whose "thinking" can't be fully
+      // disabled and draws from this same budget (see callGemini) — the
+      // visible "OK" would sometimes lose out entirely to internal
+      // reasoning tokens, making a perfectly valid key look broken.
+      maxTokens: 2048,
+      thinkingLevel: "low",
       apiKey,
       retries: 0,
     });
-    return { ok: res.text.trim().length > 0 };
+    return { ok: res.text.trim().length > 0, model: geminiModelCache.get(apiKey) };
   } catch (err) {
     return { ok: false, error: err.message || String(err) };
   }
+}
+
+function formatGeminiModelLabel(id) {
+  if (!id) return "";
+  return id.split("-").map((w) => (w[0] || "").toUpperCase() + w.slice(1)).join(" ");
 }
 
 function friendlyKeyTestError(err) {
@@ -640,6 +740,8 @@ async function runAnalysis({ rawText, style, provider, apiKey, onProgress }) {
   // --- MAP: extract structured material chunk by chunk, carrying memory forward ---
   const extractions = [];
   let memory = "";
+  let failedChunks = 0; // chunks that errored out entirely (network, parse, etc.)
+  let emptyChunks = 0; // chunks that "succeeded" but came back with nothing usable
   for (let i = 0; i < chunks.length; i++) {
     onProgress?.({ phase: "mapping", current: i + 1, total: chunks.length });
     const memoryBlock = memory
@@ -650,7 +752,11 @@ async function runAnalysis({ rawText, style, provider, apiKey, onProgress }) {
     let parsed;
     try {
       const res = await callModel({
-        provider, apiKey, maxTokens: 4096, thinkingLevel: "low",
+        // Was 4096: on top of the empty-response auto-retry in callGemini,
+        // start with a bigger baseline so a normal, content-rich chunk
+        // doesn't even need that retry (thinking tokens + a full extraction
+        // of 6-12 quotes + per-person notes can add up).
+        provider, apiKey, maxTokens: 6144, thinkingLevel: "low",
         system: EXTRACTION_SYSTEM, userContent,
       });
       parsed = parseJson(res.text);
@@ -658,18 +764,55 @@ async function runAnalysis({ rawText, style, provider, apiKey, onProgress }) {
       if (String(err.message || err).startsWith("no-api-key") || String(err.message || err).startsWith("invalid-key")) {
         throw err; // no point continuing without a working key
       }
-      // A single chunk that fails to parse shouldn't sink the whole analysis:
-      // carry the memory forward and keep going with a thinner extraction.
+      // A single chunk that fails to parse shouldn't sink the whole analysis
+      // on its own: carry the memory forward and keep going with a thinner
+      // extraction — but this failure IS tracked below and, if it happens
+      // too often, the whole run is aborted instead of quietly writing a
+      // report on top of missing material (see check after the loop).
+      failedChunks += 1;
       parsed = {
         resume_cumulatif: memory, citations_marquantes: [], observations_personnes: [],
         expressions_recurrentes: [], moments_notables: [], ambiance_generale: "",
       };
     }
+
+    const gotNothing =
+      (parsed.citations_marquantes?.length || 0) === 0 &&
+      (parsed.observations_personnes?.length || 0) === 0 &&
+      (parsed.moments_notables?.length || 0) === 0 &&
+      !parsed.ambiance_generale?.trim();
+    if (gotNothing) emptyChunks += 1;
+
     extractions.push(parsed);
     memory = parsed.resume_cumulatif || memory;
 
     // Stay safely under the free Gemini tier's requests-per-minute limit.
     if (provider === "gemini" && i < chunks.length - 1) await sleep(4200);
+  }
+
+  // If most (or all) chunks failed or came back empty, the material handed
+  // to the writer step below would be little more than blank headers — and
+  // an LLM asked to fill out a fixed report schema from an empty prompt
+  // will happily invent a plausible-looking report to comply, rather than
+  // refuse. That is exactly how a report about entirely fictional people
+  // ("Léa", "Maxime", "Thomas"...) can come out of a real, correctly-read
+  // conversation: the failure happened here, silently, one step earlier.
+  // So: tolerate a few unlucky chunks, but refuse to proceed past this
+  // point if there's essentially nothing real to write from.
+  const brokenChunks = failedChunks + emptyChunks;
+  const totalCitations = extractions.reduce((n, e) => n + (e.citations_marquantes?.length || 0), 0);
+  if (totalCitations === 0 || brokenChunks === chunks.length) {
+    throw new Error(
+      `extraction-empty: aucune matière réelle n'a pu être extraite de la conversation ` +
+      `(${brokenChunks}/${chunks.length} parties en échec ou vides). Le rapport n'a pas été généré ` +
+      `pour éviter d'inventer du contenu à la place.`
+    );
+  }
+  if (brokenChunks / chunks.length > 0.5) {
+    throw new Error(
+      `extraction-partial: plus de la moitié des parties de la conversation (${brokenChunks}/${chunks.length}) ` +
+      `n'ont pas pu être lues correctement. Le rapport n'a pas été généré pour éviter qu'il soit incomplet ou inventé.`
+    );
   }
 
   // --- REDUCE: turn the cumulative extraction into the final styled report ---
@@ -813,6 +956,10 @@ export default function ChatReportApp() {
         setError(
           msg.includes("rate-limited")
             ? "Le fournisseur d'IA reçoit trop de demandes d'un coup (limite du palier gratuit). Patiente une minute et relance."
+            : msg.startsWith("extraction-empty")
+            ? "L'IA n'a réussi à lire aucun contenu réel de ta conversation (erreur technique pendant l'analyse). Le rapport n'a volontairement pas été généré pour éviter qu'il soit inventé — réessaie, et si ça persiste, essaie avec l'autre fournisseur (Claude/Gemini) dans les réglages."
+            : msg.startsWith("extraction-partial")
+            ? "Plus de la moitié de ta conversation n'a pas pu être lue correctement. Le rapport n'a volontairement pas été généré pour éviter qu'il soit incomplet ou inventé — réessaie."
             : msg.startsWith("attempt1-call-failed") || msg.startsWith("attempt2-call-failed")
             ? "L'appel à l'IA a échoué (réseau, ou clé invalide). Regarde le détail technique ci-dessous."
             : msg.startsWith("attempt1-truncated")
@@ -1376,7 +1523,12 @@ function Onboarding({ onComplete, initialName }) {
 
             {testResult && (
               testResult.ok ? (
-                <div style={S.statusOk}><Check size={14} /> Ça fonctionne !</div>
+                <div style={S.statusOk}>
+                  <Check size={14} /> Ça fonctionne !
+                  {testResult.model && (
+                    <span style={{ opacity: 0.7 }}> · {formatGeminiModelLabel(testResult.model)}</span>
+                  )}
+                </div>
               ) : (
                 <div style={S.statusErr}>
                   <AlertCircle size={14} /> {friendlyKeyTestError(testResult.error)}
@@ -1487,7 +1639,14 @@ function SettingsModal({ config, onClose, onSave, onResetApp }) {
           </div>
           {results.gemini && (
             results.gemini.ok
-              ? <div style={S.statusOk}><Check size={14} /> Ça fonctionne !</div>
+              ? (
+                <div style={S.statusOk}>
+                  <Check size={14} /> Ça fonctionne !
+                  {results.gemini.model && (
+                    <span style={{ opacity: 0.7 }}> · {formatGeminiModelLabel(results.gemini.model)}</span>
+                  )}
+                </div>
+              )
               : <div style={S.statusErr}><AlertCircle size={14} /> {friendlyKeyTestError(results.gemini.error)}</div>
           )}
         </div>
