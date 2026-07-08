@@ -1378,7 +1378,12 @@ function Onboarding({ onComplete, initialName }) {
               testResult.ok ? (
                 <div style={S.statusOk}><Check size={14} /> Ça fonctionne !</div>
               ) : (
-                <div style={S.statusErr}><AlertCircle size={14} /> {friendlyKeyTestError(testResult.error)}</div>
+                <div style={S.statusErr}>
+                  <AlertCircle size={14} /> {friendlyKeyTestError(testResult.error)}
+                  <div style={{ fontSize: 11, opacity: 0.7, marginTop: 4, wordBreak: "break-word" }}>
+                    Détail technique : {testResult.error}
+                  </div>
+                </div>
               )
             )}
 
